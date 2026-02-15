@@ -1,0 +1,17 @@
+#V2
+Q
+list
+#list
+#reload_from
+#list
+ 10 DEFINTA-Z
+ 20 CLS
+ 30 CALL IOTGET("device/accel/x",X)
+ 40 CALL IOTGET("device/accel/y",Y)
+ 50 CALL IOTGET("device/accel/z",Z)
+ 55 A=X/8:B=Y/8:C=Z/8
+ 60 LOCATE 0,0:PRINT A;B;C
+ 70 GOTO 30
+list
+#load a.bas
+#quit

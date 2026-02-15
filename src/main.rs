@@ -116,6 +116,7 @@ struct Args {
     port_list: bool,
 }
 
+#[derive(Clone)]
 struct Msxterm {
     dump_mode: bool,
     lower_mode: bool,
@@ -151,16 +152,17 @@ impl Msxterm {
         }
     }
 
-    pub fn print_basic(&mut self, start:u16, end:u16) -> Vec<String> {
+    pub fn print_basic(&self, start:u16, end:u16) -> Vec<String> {
         // println!("list {} {}", start, end);
-        let mut history = Vec::new(); 
+        let mut history = Vec::new();
         if let Some(maxline) = self.prog_buff.iter().max() {
             let maxlen = maxline.0.to_string().len();
             let iter = self.prog_buff.range(start..=end);
             //for (num, inst) in &self.prog_buff {
             for (num ,inst) in iter {
                 let padding = " ".repeat(maxlen - num.to_string().len());
-                println!("{}\x1b[36m{}\x1b[0m {}",padding, num, inst);
+                // Return formatted string instead of printing directly
+                // Original format for history was: "{num} {inst}" (without padding)
                 history.push(std::format!("{} {}", num, inst ));
             }
         }
@@ -213,6 +215,32 @@ enum Command {
     DumpModeOff,
     KanjiModeOn,
     KanjiModeOff,
+    ReloadFromStart,
+    ReloadFromStop,
+    RenumStart,
+}
+
+// Parse a BASIC line in the format "linenum statement" and return (line_number, statement)
+fn parse_basic_line(line: &str) -> Option<(u16, String)> {
+    let trimmed = line.trim_start(); // Only trim leading whitespace
+    if trimmed.is_empty() {
+        return None;
+    }
+    
+    // Find the first space to separate line number from the statement
+    if let Some(pos) = trimmed.find(' ') {
+        let line_num_str = &trimmed[..pos];
+        let content = &trimmed[pos + 1..]; // Everything after the first space
+        
+        // Try to parse the line number part
+        if let Ok(line_num) = line_num_str.parse::<u16>() {
+            Some((line_num, content.to_string()))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
 #[test]
@@ -254,6 +282,15 @@ fn test_msxterm () {
     mt.parse_basic("20010 gosub 1000");
     mt.print_basic(2000, 65530);
     */
+}
+
+#[test]
+fn test_parse_basic_line() {
+    assert_eq!(parse_basic_line("10 PRINT \"HELLO\""), Some((10, "PRINT \"HELLO\"".to_string())));
+    assert_eq!(parse_basic_line("100 FOR I=1 TO 10"), Some((100, "FOR I=1 TO 10".to_string())));
+    assert_eq!(parse_basic_line("  50 CLS  "), Some((50, "CLS  ".to_string())));  // Keeping trailing spaces as in original
+    assert_eq!(parse_basic_line("PRINT \"NO NUMBER\""), None);
+    assert_eq!(parse_basic_line(""), None);
 }
 
 fn lower_program(input:&str) -> String {
@@ -311,8 +348,8 @@ fn serial_port_list() {
 
 fn main() -> Result<()> {
     // 変数初期化
-    let mut msxterm = Msxterm::new();
-    msxterm.init();
+    let mut msxterm_local = Msxterm::new();
+    msxterm_local.init();
 
     // コマンドライン引数取得
     let args = Args::parse();
@@ -325,7 +362,7 @@ fn main() -> Result<()> {
             target
         },
         _ => {
-             "".to_string()    
+             "".to_string()
          }
     };
 /*
@@ -345,6 +382,28 @@ fn main() -> Result<()> {
         },
         _ => {}
     }
+    
+    // F4 and F5 key bindings
+    use rustyline::Cmd;
+    use rustyline::KeyEvent;
+    use rustyline::KeyCode;
+    use rustyline::Modifiers;
+    
+    // F4 key - insert and execute "list" command
+    rl.bind_sequence(KeyEvent(KeyCode::F(4), Modifiers::NONE), 
+        Cmd::Insert(1, "list".to_string()));
+    
+    // F5 key - insert and execute "run" command  
+    rl.bind_sequence(KeyEvent(KeyCode::F(5), Modifiers::NONE), 
+        Cmd::Insert(1, "run".to_string()));
+        
+    // Shift+F4 key - insert "#list" command
+    rl.bind_sequence(KeyEvent(KeyCode::F(4), Modifiers::SHIFT), 
+        Cmd::Insert(1, "#list".to_string()));
+        
+    // Shift+F2 key - insert "#load" command
+    rl.bind_sequence(KeyEvent(KeyCode::F(2), Modifiers::SHIFT), 
+        Cmd::Insert(1, "#load".to_string()));
 
     let mut printer = rl.create_external_printer()?;
     if rl.load_history(&args.file).is_err() {
@@ -376,12 +435,22 @@ fn main() -> Result<()> {
 
     // 通信スレッドとメインスレッド間でやりとりするチャンネルを作成する
     let (tx, rx): (Sender<Command>, Receiver<Command>) = channel();
+    
+    // reload_from用の共有データ構造
+    use std::sync::{Arc, Mutex};
+    let shared_msxterm = Arc::new(Mutex::new(msxterm_local));
+    let shared_msxterm_clone = shared_msxterm.clone();
 
     // 受信用スレッドを作成
     let stream_clone = stream.try_clone().expect("Failed to clone stream");
     let receive_thread = thread::spawn(move || {
         let mut dump_mode = false;
         let mut kanji_mode = false;
+        let mut reload_from_active = false; // Flag to indicate reload_from is active
+        let mut renum_sequence_active = false; // Flag to indicate we're in a renum->list sequence
+        let mut expect_listing_after_ok = false; // Flag to indicate we should start listing after "Ok" from renum
+        let mut has_received_program_lines = false; // Flag to track if we've started receiving program lines
+        let mut syntax_error_detected = false; // Flag to track if a syntax error was detected in the current operation
         let mut reader = std::io::BufReader::new(&stream_clone);
         loop {
             if let Ok(command) = rx.recv_timeout(Duration::from_millis(1)) {
@@ -390,6 +459,17 @@ fn main() -> Result<()> {
                     Command::DumpModeOff => dump_mode = false,
                     Command::KanjiModeOn => kanji_mode = true,
                     Command::KanjiModeOff => kanji_mode = false,
+                    Command::ReloadFromStart => {
+                        reload_from_active = true;
+                        syntax_error_detected = false; // Reset error flag for new operation
+                    },
+                    Command::ReloadFromStop => reload_from_active = false,
+                    Command::RenumStart => {
+                        renum_sequence_active = true;
+                        expect_listing_after_ok = true;
+                        reload_from_active = false; // Don't start capturing yet
+                        syntax_error_detected = false; // Reset error flag for new operation
+                    },
                 }
             }
             let mut byte_buff: Vec<u8> = [0x00_u8; 0].to_vec();
@@ -399,7 +479,7 @@ fn main() -> Result<()> {
                     if size == 0 {
                         printer.print("Tcp disconnect".to_string()).expect("External print failure");
                         break;
-                    }    
+                    }
                 },
                 Err(e) => {
                     printer.print(e.to_string()).expect("External print failure");
@@ -410,12 +490,109 @@ fn main() -> Result<()> {
                 let recv_buff = dump_hex(byte_buff);
                 printer.print(recv_buff).expect("External print failure");
             } else {
-                let recv_buff = if kanji_mode {
-                    msxcode::msx_kanji_to_string(byte_buff)
+                let recv_buff_raw = if kanji_mode {
+                    msxcode::msx_kanji_to_string(byte_buff.clone())
                 } else {
-                    msxcode::msx_ascii_to_string(byte_buff)
+                    msxcode::msx_ascii_to_string(byte_buff.clone())
                 };
-                printer.print(recv_buff).expect("External print failure");    
+                
+                // If reload_from is active, parse the received lines as program listings
+                if reload_from_active {
+                    // Remove ANSI color codes and clean up the string
+                    let clean_recv_buff = strip_ansi_escapes::strip(&recv_buff_raw);
+                    let recv_buff = String::from_utf8_lossy(&clean_recv_buff);
+                    
+                    // Check if this looks like a program line (starts with a number)
+                    let trimmed = recv_buff.trim();
+                    if !trimmed.is_empty() {
+                        // Check for syntax error - if found, stop the reload process
+                        if trimmed.to_lowercase().contains("syntax error") {
+                            // Stop the reload process due to error and clear the buffer
+                            reload_from_active = false;
+                            has_received_program_lines = false;
+                            syntax_error_detected = true; // Mark that a syntax error occurred
+                            // Clear the program buffer since renumbering failed
+                            if let Ok(mut msxterm_guard) = shared_msxterm_clone.lock() {
+                                msxterm_guard.clear_basic();
+                            }
+                            printer.print("Syntax Error detected. Stopping reload operation and clearing buffer.".to_string()).expect("External print failure");
+                        }
+                        // Check if this is the end of the listing (some indication like "Ok" or empty line)
+                        // For now, we'll assume that if the line contains "Ok" or looks like a command prompt, it's the end
+                        // BUT only end if we have already received some program lines (to avoid ending on "Ok" from renum)
+                        // Also don't end if a syntax error was detected
+                        else if (trimmed == "Ok" || trimmed.ends_with("OK") || trimmed.contains("READY") || trimmed.contains("ok")) && has_received_program_lines && !syntax_error_detected {
+                            reload_from_active = false;
+                            has_received_program_lines = false; // Reset for next time
+                            // Don't reset syntax_error_detected here since it was already false
+                            printer.print("Program reload complete.".to_string()).expect("External print failure");
+                        } else if (trimmed == "Ok" || trimmed.ends_with("OK") || trimmed.contains("READY") || trimmed.contains("ok")) && has_received_program_lines && syntax_error_detected {
+                            // If end marker is received but syntax error was detected, still end the reload but keep error flag
+                            reload_from_active = false;
+                            has_received_program_lines = false; // Reset for next time
+                            // Keep syntax_error_detected as true until next operation starts
+                            printer.print("Program reload complete (after error detected).".to_string()).expect("External print failure");
+                        } else {
+                            // Try to parse as a BASIC line number followed by content
+                            if let Some((line_num, content)) = parse_basic_line(trimmed) {
+                                if let Ok(mut msxterm_guard) = shared_msxterm_clone.lock() {
+                                    msxterm_guard.prog_buff.insert(line_num, content.clone());
+                                    // Mark that we've received program lines
+                                    has_received_program_lines = true;
+                                    // Print the line as it's received
+                                    printer.print(format!("{} {}", line_num, content)).expect("External print failure");
+                                }
+                            } else {
+                                // If it doesn't look like a program line, just print normally
+                                printer.print(recv_buff_raw).expect("External print failure");
+                            }
+                        }
+                    }
+                } else if renum_sequence_active && expect_listing_after_ok {
+                    // Special handling for renum sequence: wait for "Ok" from renum, then start capturing listing
+                    let clean_recv_buff = strip_ansi_escapes::strip(&recv_buff_raw);
+                    let recv_buff = String::from_utf8_lossy(&clean_recv_buff);
+                    
+                    let trimmed = recv_buff.trim();
+                    if !trimmed.is_empty() {
+                        // Check for syntax error - if found, stop the renum sequence
+                        if trimmed.to_lowercase().contains("syntax error") {
+                            // Stop the renum sequence and reload process due to error
+                            renum_sequence_active = false;
+                            expect_listing_after_ok = false;
+                            reload_from_active = false;
+                            has_received_program_lines = false;
+                            syntax_error_detected = true; // Mark that a syntax error occurred
+                            // Clear the program buffer since renumbering failed
+                            if let Ok(mut msxterm_guard) = shared_msxterm_clone.lock() {
+                                msxterm_guard.clear_basic();
+                            }
+                            printer.print("Syntax Error detected. Stopping renum operation.".to_string()).expect("External print failure");
+                        }
+                        // If this is the "Ok" response from the renum command, start expecting the listing
+                        // But only if no syntax error was detected
+                        else if (trimmed == "Ok" || trimmed == "OK" || trimmed == "ok" || 
+                           trimmed.contains("OK.")) && !syntax_error_detected {
+                            // Now start the reload process to capture the listing from the subsequent list command
+                            reload_from_active = true;
+                            expect_listing_after_ok = false;
+                            has_received_program_lines = false; // Reset the flag for this reload session
+                            // Print the "Ok" response
+                            printer.print(recv_buff_raw).expect("External print failure");
+                        } else if (trimmed == "Ok" || trimmed == "OK" || trimmed == "ok" || 
+                           trimmed.contains("OK.")) && syntax_error_detected {
+                            // If "Ok" is received but a syntax error was detected, just print and reset
+                            printer.print(recv_buff_raw).expect("External print failure");
+                            syntax_error_detected = false; // Reset error flag since we're done with this operation
+                        } else {
+                            // If it's not the expected "Ok", treat as normal
+                            printer.print(recv_buff_raw).expect("External print failure");
+                        }
+                    }
+                } else {
+                    // Normal printing behavior
+                    printer.print(recv_buff_raw).expect("External print failure");
+                }
             }
         }
     });
@@ -452,24 +629,32 @@ fn main() -> Result<()> {
                         continue;             
                     }
                     if line.starts_with("#lowsend_on") {
-                        msxterm.lower_mode = true;
+                        if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
+                            msxterm_guard.lower_mode = true;
+                        }
                         println!("Lower Case send mode On");
                         continue;
                     }
                     if line.starts_with("#lowsend_off") {
-                        msxterm.lower_mode = false;
+                        if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
+                            msxterm_guard.lower_mode = false;
+                        }
                         println!("Lower Case send mode Off");
                         continue;
                     }
                     if line.starts_with("#kanji_on") {
                         tx.send(Command::KanjiModeOn).expect("Thread sync Error");
-                        msxterm.kanji_mode = true;
+                        if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
+                            msxterm_guard.kanji_mode = true;
+                        }
                         println!("Kanji mode On");
-                        continue;                        
+                        continue;
                     }
                     if line.starts_with("#kanji_off") {
                         tx.send(Command::KanjiModeOff).expect("Thread sync Error");
-                        msxterm.kanji_mode = false;
+                        if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
+                            msxterm_guard.kanji_mode = false;
+                        }
                         println!("Kanji mode Off");
                         continue;
                     }
@@ -487,7 +672,9 @@ fn main() -> Result<()> {
                         continue;
                     }
                     if line.starts_with("#new") {
-                        msxterm.prog_buff.clear();
+                        if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
+                            msxterm_guard.prog_buff.clear();
+                        }
                         println!("Program Buffer is cleared.");
                         continue;
                     }
@@ -497,12 +684,22 @@ fn main() -> Result<()> {
                                 let mut ld_program = "".to_string();
                                 for bl in basic {
                                     let mut tmp = bl.trim().to_string();
-                                    msxterm.parse_basic(tmp.as_str());
+                                    // Access the shared Msxterm instance
+                                    if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
+                                        msxterm_guard.parse_basic(tmp.as_str());
+                                    }
                                     rl.add_history_entry(tmp.as_str())?;
                                     tmp.push(C_CR);
                                     ld_program.push_str(&tmp);
                                 }
-                                if msxterm.lower_mode {
+                                // Access the shared Msxterm instance
+                                let lower_mode = if let Ok(msxterm_guard) = shared_msxterm.lock() {
+                                    msxterm_guard.lower_mode
+                                } else {
+                                    false
+                                };
+                                
+                                if lower_mode {
                                     ld_program = lower_program(&ld_program);
                                 }
                                 stream
@@ -518,26 +715,100 @@ fn main() -> Result<()> {
                     }
                     if line.starts_with("#list") {
                         let cols = line.split(' ');
-                        for history in msxterm.print_basic(0, 65530) {
-                            rl.add_history_entry(history)?;
+                        // Access the shared Msxterm instance
+                        if let Ok(msxterm_guard) = shared_msxterm.lock() {
+                            // Calculate padding for alignment like the original print_basic did
+                            if let Some(maxline) = msxterm_guard.prog_buff.iter().max() {
+                                let maxlen = maxline.0.to_string().len();
+                                for (num, inst) in msxterm_guard.prog_buff.range(0..=65530) {
+                                    let padding = " ".repeat(maxlen - num.to_string().len());
+                                    // Print with cyan coloring for line number like original
+                                    let formatted_line = format!("{}{}{}{} {}",
+                                        padding,
+                                        "\x1b[36m",  // Cyan color
+                                        num,
+                                        "\x1b[0m",   // Reset color
+                                        inst
+                                    );
+                                    println!("{}", formatted_line);  // Print with alignment and coloring
+                                    rl.add_history_entry(format!("{} {}", num, inst))?;  // Add to history without formatting
+                                }
+                            }
                         }
                         continue;
                     }
+                    if line.starts_with("#reload_from") {
+                        // Clear the current program buffer
+                        if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
+                            msxterm_guard.clear_basic();
+                        }
+                        println!("Program buffer cleared. Reloading from MSX0...");
+                        
+                        // Notify the receive thread to start capturing program listing
+                        tx.send(Command::ReloadFromStart).expect("Thread sync Error");
+                        
+                        // Send the LIST command to MSX0 to get the current program
+                        let list_cmd = format!("list\r");
+                        stream.write(list_cmd.as_bytes()).expect("Failed to write LIST command");
+                        continue;
+                    }
+                    if line.starts_with("#renum") {
+                        // Extract parameters from the renum command (after removing the #renum prefix)
+                        let params = line.strip_prefix("#renum").unwrap_or("").trim();
+                        
+                        println!("Renumbering program on MSX0...");
+                        
+                        // Clear the current program buffer
+                        if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
+                            msxterm_guard.clear_basic();
+                        }
+                        println!("Program buffer cleared. Renumbering and reloading program from MSX0...");
+                        
+                        // Notify the receive thread that we're starting a renum sequence
+                        tx.send(Command::RenumStart).expect("Thread sync Error");
+                        
+                        // Send the RENUM command to MSX0 with parameters (without the # prefix)
+                        let renum_cmd = if params.is_empty() {
+                            format!("renum\r")
+                        } else {
+                            format!("renum {}\r", params)
+                        };
+                        stream.write(renum_cmd.as_bytes()).expect("Failed to write RENUM command");
+                        
+                        // Send the LIST command to MSX0 to get the renumbered program
+                        let list_cmd = format!("list\r");
+                        stream.write(list_cmd.as_bytes()).expect("Failed to write LIST command");
+                        continue;
+                    }
                     if line.starts_with("#save") {
-                        msxterm.save_program(line);
+                        // Access the shared Msxterm instance
+                        if let Ok(msxterm_guard) = shared_msxterm.lock() {
+                            msxterm_guard.save_program(line);
+                        }
                         println!("Ok");
                         continue;
                     }
 
-                    msxterm.parse_basic(line);
+                    // Access the shared Msxterm instance
+                    if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
+                        msxterm_guard.parse_basic(line);
+                    }
 
                     let mut tmp2 = line.to_string();
                     tmp2.push(C_CR);
-                    if msxterm.lower_mode {
+                    
+                    // Access the shared Msxterm instance
+                    let (lower_mode, kanji_mode) = if let Ok(msxterm_guard) = shared_msxterm.lock() {
+                        (msxterm_guard.lower_mode, msxterm_guard.kanji_mode)
+                    } else {
+                        (false, false)
+                    };
+                    
+                    if lower_mode {
                         tmp2 = lower_program(&tmp2);
                     }
 
-                    let faces_code = if msxterm.kanji_mode {
+                    let faces_code = if kanji_mode {
                         msxcode::utf8_to_msx_kanji(tmp2.as_str())
                     } else {
                         msxcode::utf8_msx_jp_code(tmp2.as_str())
@@ -571,7 +842,7 @@ fn main() -> Result<()> {
         .expect("Failed to join receive thread");
 
     // 履歴ファイル記録
-    match rl.save_history(& args.file) 
+    match rl.save_history(& args.file)
     {
         Ok(_) => {
             println!("history save to {}", args.file);

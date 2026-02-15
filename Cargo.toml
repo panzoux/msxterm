@@ -1,6 +1,6 @@
 [package]
 name = "msxterm"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["Akio Setsumasa","<setumasa@gmail.com>"]
 description = "CUI terminal software for MSX0"
@@ -16,4 +16,5 @@ clap = { version = "4.1", features = ["derive"] }
 regex = "1.7.3"
 serial2 = "0.2.7"
 encoding_rs = "0.8.33"
+strip-ansi-escapes = "0.2.0"
 
