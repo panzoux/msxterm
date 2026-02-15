@@ -515,14 +515,7 @@ fn main() -> Result<()> {
                     let trimmed = recv_buff.trim();
                     if !trimmed.is_empty() {
                         // Check for various error messages - if found, stop the reload process
-                        if trimmed.to_lowercase().contains("syntax error") ||
-                           trimmed.to_lowercase().contains("out of memory") ||
-                           trimmed.to_lowercase().contains("overflow") ||
-                           trimmed.to_lowercase().contains("next without for") ||
-                           trimmed.to_lowercase().contains("return without gosub") ||
-                           trimmed.to_lowercase().contains("undefined line") ||
-                           trimmed.to_lowercase().contains("illegal function call") ||
-                           trimmed.to_lowercase().contains("string too long") {
+                        if is_error_message(trimmed) {
                             // Stop the reload process due to error and clear the buffer
                             reload_from_active = false;
                             has_received_program_lines = false;
@@ -537,12 +530,12 @@ fn main() -> Result<()> {
                         // For now, we'll assume that if the line contains "Ok" or looks like a command prompt, it's the end
                         // BUT only end if we have already received some program lines (to avoid ending on "Ok" from renum)
                         // Also don't end if a syntax error was detected
-                        else if (trimmed == "Ok" || trimmed.ends_with("OK") || trimmed.contains("READY") || trimmed.contains("ok")) && has_received_program_lines && !syntax_error_detected {
+                        else if trimmed.to_lowercase().contains("ok") && has_received_program_lines && !syntax_error_detected {
                             reload_from_active = false;
                             has_received_program_lines = false; // Reset for next time
                             // Don't reset syntax_error_detected here since it was already false
                             printer.print("Program reload complete.".to_string()).expect("External print failure");
-                        } else if (trimmed == "Ok" || trimmed.ends_with("OK") || trimmed.contains("READY") || trimmed.contains("ok")) && has_received_program_lines && syntax_error_detected {
+                        } else if trimmed.to_lowercase().contains("ok") && has_received_program_lines && syntax_error_detected {
                             // If end marker is received but syntax error was detected, still end the reload but keep error flag
                             reload_from_active = false;
                             has_received_program_lines = false; // Reset for next time
@@ -572,14 +565,7 @@ fn main() -> Result<()> {
                     let trimmed = recv_buff.trim();
                     if !trimmed.is_empty() {
                         // Check for various error messages - if found, stop the renum sequence
-                        if trimmed.to_lowercase().contains("syntax error") ||
-                           trimmed.to_lowercase().contains("out of memory") ||
-                           trimmed.to_lowercase().contains("overflow") ||
-                           trimmed.to_lowercase().contains("next without for") ||
-                           trimmed.to_lowercase().contains("return without gosub") ||
-                           trimmed.to_lowercase().contains("undefined line") ||
-                           trimmed.to_lowercase().contains("illegal function call") ||
-                           trimmed.to_lowercase().contains("string too long") {
+                        if is_error_message(trimmed) {
                             // Stop the renum sequence and reload process due to error
                             renum_sequence_active = false;
                             expect_listing_after_ok = false;
@@ -591,8 +577,7 @@ fn main() -> Result<()> {
                         }
                         // If this is the "Ok" response from the renum command, start expecting the listing
                         // But only if no syntax error was detected
-                        else if (trimmed == "Ok" || trimmed == "OK" || trimmed == "ok" || 
-                           trimmed.contains("OK.")) && !syntax_error_detected {
+                        else if trimmed.to_lowercase().contains("ok") && !syntax_error_detected {
                             // Now start the reload process to capture the listing from the subsequent list command
                             reload_from_active = true;
                             expect_listing_after_ok = false;
@@ -611,8 +596,7 @@ fn main() -> Result<()> {
                             
                             // Print the "Ok" response
                             printer.print(recv_buff_raw).expect("External print failure");
-                        } else if (trimmed == "Ok" || trimmed == "OK" || trimmed == "ok" || 
-                           trimmed.contains("OK.")) && syntax_error_detected {
+                        } else if trimmed.to_lowercase().contains("ok") && syntax_error_detected {
                             // If "Ok" is received but a syntax error was detected, just print and reset
                             printer.print(recv_buff_raw).expect("External print failure");
                             syntax_error_detected = false; // Reset error flag since we're done with this operation
@@ -877,6 +861,62 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Check if the message contains an error
+fn is_error_message(message: &str) -> bool {
+    let lower_msg = message.to_lowercase();
+    lower_msg.contains("next without for") ||
+    lower_msg.contains("syntax error") ||
+    lower_msg.contains("return without gosub") ||
+    lower_msg.contains("out of data") ||
+    lower_msg.contains("illegal function call") ||
+    lower_msg.contains("overflow") ||
+    lower_msg.contains("out of memory") ||
+    lower_msg.contains("undefined line number") ||
+    lower_msg.contains("subscript out of range") ||
+    lower_msg.contains("redimensioned array") ||
+    lower_msg.contains("division by zero") ||
+    lower_msg.contains("illegal direct") ||
+    lower_msg.contains("type mismatch") ||
+    lower_msg.contains("out of string space") ||
+    lower_msg.contains("string too long") ||
+    lower_msg.contains("string formula too complex") ||
+    lower_msg.contains("can't continue") ||
+    lower_msg.contains("undefined user function") ||
+    lower_msg.contains("device i/o error") ||
+    lower_msg.contains("verify error") ||
+    lower_msg.contains("no resume") ||
+    lower_msg.contains("resume without error") ||
+    lower_msg.contains("unprintable error") ||
+    lower_msg.contains("missing operand") ||
+    lower_msg.contains("line buffer overflow") ||
+    lower_msg.contains("field overflow") ||
+    lower_msg.contains("internal error") ||
+    lower_msg.contains("bad file number") ||
+    lower_msg.contains("file not found") ||
+    lower_msg.contains("file already open") ||
+    lower_msg.contains("input past end") ||
+    lower_msg.contains("bad file name") ||
+    lower_msg.contains("direct statement in file") ||
+    lower_msg.contains("sequential i/o only") ||
+    lower_msg.contains("file not open") ||
+    lower_msg.contains("bad fat") ||
+    lower_msg.contains("bad file mode") ||
+    lower_msg.contains("bad drive name") ||
+    lower_msg.contains("bad sector number") ||
+    lower_msg.contains("file still open") ||
+    lower_msg.contains("file already exists") ||
+    lower_msg.contains("disk full") ||
+    lower_msg.contains("too many files") ||
+    lower_msg.contains("disk write protect") ||
+    lower_msg.contains("disk i/o error") ||
+    lower_msg.contains("disk offline") ||
+    lower_msg.contains("rename across disk") ||
+    lower_msg.contains("file write protected") ||
+    lower_msg.contains("directory already exists") ||
+    lower_msg.contains("directory not found") ||
+    lower_msg.contains("ram disk already exists")
 }
 
 
