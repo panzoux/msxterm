@@ -218,6 +218,7 @@ enum Command {
     ReloadFromStart,
     ReloadFromStop,
     RenumStart,
+    ConditionalCommandStart,
 }
 
 // Parse a BASIC line in the format "linenum statement" and return (line_number, statement)
@@ -440,9 +441,10 @@ fn main() -> Result<()> {
     use std::sync::{Arc, Mutex};
     let shared_msxterm = Arc::new(Mutex::new(msxterm_local));
     let shared_msxterm_clone = shared_msxterm.clone();
-
+    
     // 受信用スレッドを作成
     let stream_clone = stream.try_clone().expect("Failed to clone stream");
+    let command_stream_for_receive_thread = stream.try_clone().expect("Failed to clone stream for receive thread commands");
     let receive_thread = thread::spawn(move || {
         let mut dump_mode = false;
         let mut kanji_mode = false;
@@ -451,6 +453,8 @@ fn main() -> Result<()> {
         let mut expect_listing_after_ok = false; // Flag to indicate we should start listing after "Ok" from renum
         let mut has_received_program_lines = false; // Flag to track if we've started receiving program lines
         let mut syntax_error_detected = false; // Flag to track if a syntax error was detected in the current operation
+        let pending_command: Option<String> = None; // Command to execute if no error occurs
+        let mut command_stream = command_stream_for_receive_thread;
         let mut reader = std::io::BufReader::new(&stream_clone);
         loop {
             if let Ok(command) = rx.recv_timeout(Duration::from_millis(1)) {
@@ -469,6 +473,11 @@ fn main() -> Result<()> {
                         expect_listing_after_ok = true;
                         reload_from_active = false; // Don't start capturing yet
                         syntax_error_detected = false; // Reset error flag for new operation
+                    },
+                    Command::ConditionalCommandStart => {
+                        // This would be used to indicate we're waiting for a response
+                        // before executing a pending command
+                        syntax_error_detected = false; // Reset error flag
                     },
                 }
             }
@@ -505,8 +514,15 @@ fn main() -> Result<()> {
                     // Check if this looks like a program line (starts with a number)
                     let trimmed = recv_buff.trim();
                     if !trimmed.is_empty() {
-                        // Check for syntax error - if found, stop the reload process
-                        if trimmed.to_lowercase().contains("syntax error") {
+                        // Check for various error messages - if found, stop the reload process
+                        if trimmed.to_lowercase().contains("syntax error") ||
+                           trimmed.to_lowercase().contains("out of memory") ||
+                           trimmed.to_lowercase().contains("overflow") ||
+                           trimmed.to_lowercase().contains("next without for") ||
+                           trimmed.to_lowercase().contains("return without gosub") ||
+                           trimmed.to_lowercase().contains("undefined line") ||
+                           trimmed.to_lowercase().contains("illegal function call") ||
+                           trimmed.to_lowercase().contains("string too long") {
                             // Stop the reload process due to error and clear the buffer
                             reload_from_active = false;
                             has_received_program_lines = false;
@@ -555,19 +571,23 @@ fn main() -> Result<()> {
                     
                     let trimmed = recv_buff.trim();
                     if !trimmed.is_empty() {
-                        // Check for syntax error - if found, stop the renum sequence
-                        if trimmed.to_lowercase().contains("syntax error") {
+                        // Check for various error messages - if found, stop the renum sequence
+                        if trimmed.to_lowercase().contains("syntax error") ||
+                           trimmed.to_lowercase().contains("out of memory") ||
+                           trimmed.to_lowercase().contains("overflow") ||
+                           trimmed.to_lowercase().contains("next without for") ||
+                           trimmed.to_lowercase().contains("return without gosub") ||
+                           trimmed.to_lowercase().contains("undefined line") ||
+                           trimmed.to_lowercase().contains("illegal function call") ||
+                           trimmed.to_lowercase().contains("string too long") {
                             // Stop the renum sequence and reload process due to error
                             renum_sequence_active = false;
                             expect_listing_after_ok = false;
                             reload_from_active = false;
                             has_received_program_lines = false;
                             syntax_error_detected = true; // Mark that a syntax error occurred
-                            // Clear the program buffer since renumbering failed
-                            if let Ok(mut msxterm_guard) = shared_msxterm_clone.lock() {
-                                msxterm_guard.clear_basic();
-                            }
-                            printer.print("Syntax Error detected. Stopping renum operation.".to_string()).expect("External print failure");
+                            // DO NOT clear the program buffer since renumbering failed - preserve original content
+                            printer.print("Syntax Error detected. Stopping renum operation. Buffer preserved.".to_string()).expect("External print failure");
                         }
                         // If this is the "Ok" response from the renum command, start expecting the listing
                         // But only if no syntax error was detected
@@ -577,6 +597,18 @@ fn main() -> Result<()> {
                             reload_from_active = true;
                             expect_listing_after_ok = false;
                             has_received_program_lines = false; // Reset the flag for this reload session
+                            // Clear the program buffer now that renum was successful
+                            if let Ok(mut msxterm_guard) = shared_msxterm_clone.lock() {
+                                msxterm_guard.clear_basic();
+                            }
+                            println!("Program buffer cleared. Reloading renumbered program from MSX0...");
+                            
+                            // Send the list command to MSX0 to get the renumbered program
+                            let list_cmd = format!("list\r");
+                            if let Err(e) = command_stream.write(list_cmd.as_bytes()) {
+                                eprintln!("Error sending list command: {}", e);
+                            }
+                            
                             // Print the "Ok" response
                             printer.print(recv_buff_raw).expect("External print failure");
                         } else if (trimmed == "Ok" || trimmed == "OK" || trimmed == "ok" || 
@@ -757,12 +789,7 @@ fn main() -> Result<()> {
                         let params = line.strip_prefix("#renum").unwrap_or("").trim();
                         
                         println!("Renumbering program on MSX0...");
-                        
-                        // Clear the current program buffer
-                        if let Ok(mut msxterm_guard) = shared_msxterm.lock() {
-                            msxterm_guard.clear_basic();
-                        }
-                        println!("Program buffer cleared. Renumbering and reloading program from MSX0...");
+                        println!("Checking for errors before clearing local buffer...");
                         
                         // Notify the receive thread that we're starting a renum sequence
                         tx.send(Command::RenumStart).expect("Thread sync Error");
@@ -775,9 +802,7 @@ fn main() -> Result<()> {
                         };
                         stream.write(renum_cmd.as_bytes()).expect("Failed to write RENUM command");
                         
-                        // Send the LIST command to MSX0 to get the renumbered program
-                        let list_cmd = format!("list\r");
-                        stream.write(list_cmd.as_bytes()).expect("Failed to write LIST command");
+                        // The receive thread will handle conditional execution of reload_from
                         continue;
                     }
                     if line.starts_with("#save") {
@@ -853,3 +878,5 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+
