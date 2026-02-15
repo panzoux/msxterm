@@ -403,8 +403,16 @@ fn main() -> Result<()> {
         Cmd::Insert(1, "#list".to_string()));
         
     // Shift+F2 key - insert "#load" command
-    rl.bind_sequence(KeyEvent(KeyCode::F(2), Modifiers::SHIFT), 
-        Cmd::Insert(1, "#load".to_string()));
+    rl.bind_sequence(KeyEvent(KeyCode::F(2), Modifiers::SHIFT),
+        Cmd::Insert(1, "#load ".to_string()));
+
+    // F10 key - insert "#quit" command
+    rl.bind_sequence(KeyEvent(KeyCode::F(10), Modifiers::NONE),
+        Cmd::Insert(1, "#quit".to_string()));
+
+    // Shift+F5 key - insert "#save" command
+    rl.bind_sequence(KeyEvent(KeyCode::F(5), Modifiers::SHIFT),
+        Cmd::Insert(1, "#save ".to_string()));
 
     let mut printer = rl.create_external_printer()?;
     if rl.load_history(&args.file).is_err() {
@@ -917,6 +925,30 @@ fn is_error_message(message: &str) -> bool {
     lower_msg.contains("directory already exists") ||
     lower_msg.contains("directory not found") ||
     lower_msg.contains("ram disk already exists")
+}
+
+#[test]
+fn test_is_error_message() {
+    // Test positive cases
+    assert_eq!(is_error_message("Syntax error"), true);
+    assert_eq!(is_error_message("OUT OF MEMORY"), true);
+    assert_eq!(is_error_message("Overflow"), true);
+    assert_eq!(is_error_message("NEXT without FOR"), true);
+    assert_eq!(is_error_message("RETURN without GOSUB"), true);
+    assert_eq!(is_error_message("Undefined line number"), true);
+    assert_eq!(is_error_message("Illegal function call"), true);
+    assert_eq!(is_error_message("String too long"), true);
+    assert_eq!(is_error_message("Division by zero"), true);
+    assert_eq!(is_error_message("Type mismatch"), true);
+    assert_eq!(is_error_message("Disk full"), true);
+    assert_eq!(is_error_message("File not found"), true);
+    
+    // Test negative cases
+    assert_eq!(is_error_message("Ok"), false);
+    assert_eq!(is_error_message("Ready"), false);
+    assert_eq!(is_error_message("10 PRINT \"HELLO\""), false);
+    assert_eq!(is_error_message(""), false);
+    assert_eq!(is_error_message("Normal output"), false);
 }
 
 
