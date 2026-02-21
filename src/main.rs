@@ -589,6 +589,7 @@ fn main() -> Result<()> {
                             // Now start the reload process to capture the listing from the subsequent list command
                             reload_from_active = true;
                             expect_listing_after_ok = false;
+                            renum_sequence_active = false; // Reset the renum sequence flag since we're done with it
                             has_received_program_lines = false; // Reset the flag for this reload session
                             // Clear the program buffer now that renum was successful
                             if let Ok(mut msxterm_guard) = shared_msxterm_clone.lock() {
@@ -738,13 +739,15 @@ fn main() -> Result<()> {
                         continue;
                     }
                     if line.starts_with("#list") {
-                        let cols = line.split(' ');
+                        let (st, ed) = parse_command(line);
+                        let start = st.unwrap_or(0);
+                        let end = ed.unwrap_or(65530);
                         // Access the shared Msxterm instance
                         if let Ok(msxterm_guard) = shared_msxterm.lock() {
                             // Calculate padding for alignment like the original print_basic did
                             if let Some(maxline) = msxterm_guard.prog_buff.iter().max() {
                                 let maxlen = maxline.0.to_string().len();
-                                for (num, inst) in msxterm_guard.prog_buff.range(0..=65530) {
+                                for (num, inst) in msxterm_guard.prog_buff.range(start..=end) {
                                     let padding = " ".repeat(maxlen - num.to_string().len());
                                     // Print with cyan coloring for line number like original
                                     let formatted_line = format!("{}{}{}{} {}",
